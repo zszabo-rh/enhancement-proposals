@@ -23,9 +23,9 @@ Extract all storage provisioning logic from the Tenant controller into a dedicat
 
 ## Motivation
 
-Storage provisioning logic is currently embedded in the Tenant controller (`internal/controller/tenant_controller.go`, ~350 of ~520 lines). The controller handles namespace creation, UDN reconciliation, StorageClass resolution, AAP job triggering, job polling, and storage deprovisioning — all in a single reconciliation loop. Storage readiness gates the Tenant phase: a Tenant cannot reach Ready until a StorageClass is resolved.
+Storage provisioning logic is currently embedded in the Tenant controller (`internal/controller/tenant_controller.go`, ~350 of ~520 lines). The controller handles namespace creation, UserDefinedNetwork (UDN) reconciliation, StorageClass resolution, AAP job triggering, job polling, and storage deprovisioning — all in a single reconciliation loop. Storage readiness gates the Tenant phase: a Tenant cannot reach Ready until a StorageClass is resolved.
 
-This coupling creates three problems. First, any change to storage onboarding risks regressions in namespace creation and UDN reconciliation. Second, supporting different storage workflows per delivery model (VMaaS requires immediate provisioning; CaaS requires waiting for ClusterOrder Ready) requires branching logic inside the Tenant controller. Third, the storage working group cannot iterate on storage onboarding without coordinating every change with the core tenant lifecycle.
+This coupling creates three problems. First, any change to storage onboarding risks regressions in namespace creation and UserDefinedNetwork (UDN) reconciliation. Second, supporting different storage workflows per delivery model (VMaaS requires immediate provisioning; CaaS requires waiting for ClusterOrder Ready) requires branching logic inside the Tenant controller. Third, the storage working group cannot iterate on storage onboarding without coordinating every change with the core tenant lifecycle.
 
 The extraction moves the same provisioning logic into a new controller. The Tenant controller becomes namespace and UDN only. The OSAC Storage Controller owns all storage conditions and fields on the Tenant CR, following the Kubernetes condition ownership pattern where multiple controllers independently manage their own conditions on a shared resource — the same pattern used by kubelet, scheduler, and cloud-controller-manager on Node.
 
@@ -41,13 +41,13 @@ The extraction moves the same provisioning logic into a new controller. The Tena
 - Modifying the shared provisioning framework (`pkg/provisioning/`).
 - Adding a new CRD — storage state lives on the Tenant CR via condition ownership.
 - Changing the ComputeInstance controller — it continues to read `status.storageClasses` from the Tenant CR.
-- StorageClass creation — the controller discovers existing SCs via label; AAP playbooks create them.
-- CaaS Stage 2 trigger logic (OSAC-1123) — the controller establishes the ClusterOrder watch but takes no action on events.
+- StorageClass creation in the controller — the OSAC Storage Controller discovers existing SCs via label but does not create them directly. StorageClass creation is handled by the `osac-create-tenant-storage-class` AAP playbook, which is in scope (FR-8).
+- CaaS Stage 2 trigger logic (OSAC-1123) — the controller establishes the ClusterOrder watch to prepare for CaaS support, but the trigger logic for cluster-side storage setup on CaaS clusters is a separate PRD and delivery.
 - VAST-specific logic in the operator — the controller is provider-agnostic; VAST specifics live in AAP playbooks.
 
 ## Proposal
 
-Introduce an OSAC Storage Controller that watches Tenant CRs as its primary resource. The controller owns `StorageBackendReady` and `StorageClassReady` conditions, `status.storageClasses`, and `status.jobs` on the Tenant CR. It places its own finalizer (`osac.openshift.io/storage`) for teardown. The Tenant controller is stripped of all storage logic — it manages namespace creation and UDN reconciliation only.
+Introduce an OSAC Storage Controller that watches Tenant CRs as its primary resource. The controller owns `StorageBackendReady` and `StorageClassReady` conditions, `status.storageClasses`, and `status.jobs` on the Tenant CR. It places its own finalizer (`osac.openshift.io/storage`) for teardown. The Tenant controller is stripped of all storage logic — it manages namespace creation and UserDefinedNetwork (UDN) reconciliation only.
 
 The AAP playbooks are split from two templates (create/delete) into four lifecycle actions matching the two-stage model: `osac-create-tenant-storage-backend`, `osac-create-tenant-storage-class`, `osac-delete-tenant-storage-class`, `osac-delete-tenant-storage-backend`.
 
@@ -98,7 +98,7 @@ The diagram shows the two-stage flow from Tenant creation to storage readiness. 
 
 #### Error Handling
 
-- **AAP job fails (Stage 1 or 2):** The relevant condition is set to `False` with a reason reflecting the failure. The controller does not retry automatically after failure — it waits for an external trigger (Tenant CR update, Secret watch event) to avoid infinite retry loops. This matches the existing pattern on main.
+- **AAP job fails (Stage 1 or 2):** The relevant condition is set to `False` with a reason reflecting the failure. The controller does not retry automatically after failure — it waits for an external trigger (Tenant CR update, Secret watch event) to avoid infinite retry loops. This follows the same pattern used by other OSAC controllers.
 - **Hub Secret deleted after Ready:** Secret watch triggers re-reconciliation. `StorageBackendReady` set to `False`, re-triggers Stage 1.
 - **StorageClasses deleted after Ready:** StorageClass watch triggers re-reconciliation. `StorageClassReady` set to `False`, `status.storageClasses` cleared, re-triggers Stage 2.
 
@@ -122,7 +122,7 @@ const (
 )
 ```
 
-`StorageClassReady` already exists on the Tenant CR on upstream main.
+`StorageClassReady` already exists on the Tenant CR.
 
 **New finalizer on Tenant CR:**
 
@@ -230,7 +230,7 @@ Remove from `TenantReconciler`:
 - SC resolution and provisioning logic from `handleUpdate()`
 - Deprovisioning from `handleDelete()`
 
-After extraction, the Tenant controller manages: finalizer, namespace check, `NamespaceReady` condition, UDN reconciliation, Phase transitions. Approximately 170 lines.
+After extraction, the Tenant controller manages: finalizer, namespace check, `NamespaceReady` condition, UserDefinedNetwork (UDN) reconciliation, Phase transitions. Approximately 170 lines.
 
 **Tenant Phase semantics change:** Today, a Tenant cannot reach `Phase=Ready` until StorageClasses are resolved — storage gates the phase. After extraction, `Phase=Ready` means the tenant namespace exists and UDN is configured. Storage readiness is reported separately via `StorageBackendReady` and `StorageClassReady` conditions. This decoupling is intentional — it allows the Tenant to be "ready" for non-storage operations (namespace, networking) while storage provisioning proceeds asynchronously. The ComputeInstance controller already checks `StorageClassReady` independently before provisioning VMs.
 
@@ -376,7 +376,7 @@ The operator uses per-controller enable flags (e.g., `OSAC_ENABLE_CLUSTER_CONTRO
 - Two controllers running simultaneously on the same Tenant CR
 - Status update conflict handling (verify both controllers converge)
 
-**E2E tests** (edge-17 with VAST):
+**E2E tests** (OSAC deployment connected to a VAST appliance):
 - Full lifecycle: Tenant creation → Stage 1 → Stage 2 → StorageClasses visible → Tenant deletion → teardown complete
 
 ## Graduation Criteria
