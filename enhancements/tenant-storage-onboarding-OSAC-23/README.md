@@ -49,7 +49,7 @@ The extraction moves the same provisioning logic into a new controller. The Tena
 
 Introduce an OSAC Storage Controller that watches Tenant CRs as its primary resource. The controller owns `StorageBackendReady` and `StorageClassReady` conditions, `status.storageClasses`, and `status.jobs` on the Tenant CR. It places its own finalizer (`osac.openshift.io/storage`) for teardown. The Tenant controller is stripped of all storage logic — it manages namespace creation and UserDefinedNetwork (UDN) reconciliation only.
 
-The AAP playbooks are split from two templates (create/delete) into four lifecycle actions matching the two-stage model: `osac-create-tenant-storage-backend`, `osac-create-tenant-storage-class`, `osac-delete-tenant-storage-class`, `osac-delete-tenant-storage-backend`.
+The AAP playbooks are split from two templates (create/delete) into four lifecycle actions matching the two-stage model: `osac-create-tenant-storage-backend`, `osac-create-tenant-storage-class`, `osac-delete-tenant-storage-class`, `osac-delete-tenant-storage-backend`. Each deletion playbook targets only its own scope — `delete-class` removes cluster-side K8s resources (StorageClasses, VolumeSnapshotClasses, CSI Secret) without touching the backend; `delete-backend` removes VAST backend resources and hub Secret without touching cluster-side resources. This separation is required for CaaS where a ClusterOrder deletion must clean up cluster resources for one cluster without destroying the backend that other clusters depend on.
 
 ### Workflow Description
 
@@ -106,7 +106,7 @@ The diagram shows the two-stage flow from Tenant creation to storage readiness. 
 
 1. OSAC Storage Controller observes Tenant deletion via `DeletionTimestamp`.
 2. Controller triggers `osac-delete-tenant-storage-class` AAP job (cluster-side cleanup: remove StorageClasses, CSI Secrets, VolumeSnapshotClasses from the target cluster).
-3. On class cleanup success, triggers `osac-delete-tenant-storage-backend` AAP job (backend teardown: remove VAST tenant, views, quotas, and hub Secret).
+3. On class cleanup success, triggers `osac-delete-tenant-storage-backend` AAP job (backend-only teardown via `teardown_backend` action: remove VAST tenant, views, quotas, and hub Secret without touching cluster-side resources).
 4. On backend teardown success, removes the `osac.openshift.io/storage` finalizer.
 5. If either teardown job fails with `BlockDeletionOnFailure=true`, the finalizer remains and the Tenant stays in `Terminating` until resolved.
 
@@ -180,10 +180,10 @@ func (t *Tenant) GetStatusCondition(condType TenantConditionType) *metav1.Condit
 
 The `ProvisioningProvider` interface supports one provision/deprovision template pair per instance. The Storage Controller uses two provider instances:
 
-| Provider | Provision Template | Deprovision Template | Stage |
-|----------|-------------------|---------------------|-------|
-| Backend provider | `osac-create-tenant-storage-backend` | `osac-delete-tenant-storage-backend` | Stage 1 |
-| Class provider | `osac-create-tenant-storage-class` | `osac-delete-tenant-storage-class` | Stage 2 |
+| Provider | Provision Template | Deprovision Template | Action | Stage |
+|----------|-------------------|---------------------|--------|-------|
+| Backend provider | `osac-create-tenant-storage-backend` | `osac-delete-tenant-storage-backend` | `setup` / `teardown_backend` | Stage 1 |
+| Class provider | `osac-create-tenant-storage-class` | `osac-delete-tenant-storage-class` | `ensure_storage_class` / `cleanup` | Stage 2 |
 
 The controller manages two separate job lifecycles. `status.jobs` on the Tenant CR tracks both — differentiated by extending `JobType` with four new values:
 
