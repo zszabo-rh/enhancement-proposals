@@ -256,7 +256,7 @@ New env vars:
 
 ### Security Considerations
 
-The feature inherits the existing security model without changes. Admin credentials (VAST endpoint, username, password) remain ephemeral — mounted as environment variables in the AAP automation pod, cleared after use, never persisted to Kubernetes. [PRD: NFR-1]
+The feature inherits the existing security model without changes. Admin credentials (VAST endpoint, username, password) are mounted as environment variables in the AAP automation pod from a pre-configured Secret, cleared from playbook memory after use, and never accessed by the controller. [PRD: NFR-1]
 
 Per-tenant credentials are stored in Secrets in the `osac-system` namespace with RBAC restricted to the operator service account. The Storage Controller requires `get;list;watch` on Secrets in `osac-system`. [PRD: NFR-2]
 
@@ -306,7 +306,7 @@ No new Prometheus metrics or alerts. Storage readiness is observable via:
 
 ### Risks and Mitigations
 
-**Breaking change in AAP playbook interface:** The current combined playbook (`osac-create-tenant-storage`) is replaced by four separate playbooks. Deploying AAP changes without operator changes causes the Tenant controller to call a template name that no longer exists — provisioning fails. Mitigation: coordinated PR merge across osac-operator and osac-aap. PRs are linked in descriptions. Deployment documentation specifies both components must be updated together. [PRD: NFR-3]
+**Coordinated deployment required:** The operator and AAP changes must be deployed together (NFR-3). Deploying one without the other causes template name mismatches. This is a deployment note, not a risk — the project is pre-GA and breaking changes are expected. PRs are linked in descriptions and deployment documentation specifies both components must be updated together.
 
 **Status update conflicts between controllers:** Both the Tenant controller and the Storage Controller call `r.Status().Update()` on the same Tenant CR. If both controllers reconcile simultaneously, one will receive a `409 Conflict` from the API server. Mitigation: controller-runtime automatically retries the reconciliation on conflict. The `oldStatus` comparison in each controller's Reconcile function prevents unnecessary writes. This is the standard multi-controller pattern used in Kubernetes (kubelet, scheduler, and cloud-controller-manager all update Node status independently).
 
