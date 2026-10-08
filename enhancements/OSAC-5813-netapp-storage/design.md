@@ -7,7 +7,7 @@
 | PRD | [prd.md](prd.md) |
 | Date | 2026-10-06 |
 | Last updated | 2026-10-08 |
-| Status | Draft — dedicated prepared-SVM proposal; team agreement pending |
+| Status | Draft — named SVM preassignment; hub and dedicated VMaaS |
 
 # 1. Overview
 
@@ -16,12 +16,12 @@ dedicated, administrator-prepared ONTAP SVM. An ONTAP AAP role validates/claims
 prepared storage and creates native Trident backend/tier bindings; it does not
 create or delete SVMs/LIFs. See [PRD](prd.md) for product requirements.
 
-This draft assumes acceptance of the prepared-SVM proposal. Credential and
-manual-release conventions, names and schema changes below are concrete proposals
+Credential and manual-release conventions, names and schema changes below are
+concrete proposals
 for review (§9). The baseline uses separate SVM management endpoints/accounts;
 a shared cluster management endpoint remains an alternative requiring agreement.
-Prepared-SVM selection and hub versus remote VM placement also need alignment
-with the preview scope (§9.6–9.7).
+The MVP preassigns a named SVM to each tenant. It supports one configured VM
+hosting cluster per deployment: either the hub or a dedicated remote cluster.
 
 # 2. Goals and Non-Goals
 
@@ -38,7 +38,7 @@ with the preview scope (§9.6–9.7).
 - Driver installation automation, OSAC CSI changes, Enclave, CaaS/BMaaS, fabric zoning or HBA setup.
 - Automatic SVM/LIF/account/policy provisioning or deletion, free-SVM allocation,
   automated sanitization and new credential-rotation automation.
-- Multi-backend/cluster preview profiles and other transports.
+- Multiple backends, concurrent VM hosting targets, cluster-per-tenant provisioning and other transports.
 
 # 3. Motivation / Background
 
@@ -55,11 +55,47 @@ backend/classes, rather than a physical provisioning recipe.
 | Owner | Responsibility / missing work |
 |---|---|
 | Configuration owner | ONTAP registration probe; typed tier QoS; UI/CLI support; operator-to-AAP QoS/encryption mapping; API storage-status projection |
-| Onboarding owner | ONTAP AAP role; prepared-SVM discovery/claim; native backend/classes; persisted progress, readiness and guarded teardown |
+| Onboarding owner | ONTAP AAP role; hub/hosting-target routing; prepared-SVM discovery/claim; native backend/classes; persisted progress, target-aware readiness and guarded teardown |
 | Cloud Infrastructure Admin / QE | Manual array/FC/native-driver preparation, protected SVM credentials/policies, tested-version documentation and joint VM acceptance |
 
 Registration and tenant creation are independent activities. The following
 phases define their handoff; the diagram covers only the later onboarding.
+
+### VM hosting target and resource placement
+
+The hub runs OSAC's API, operator and AAP. The VM hosting cluster runs KubeVirt,
+CDI and native Trident; it is either that same hub or one preconfigured dedicated
+remote cluster. Dedicated VMaaS does not create a compute cluster per tenant.
+
+| Resource / operation | Cluster |
+|---|---|
+| Backend/tier API records, registration probe, Tenant CR and conditions | Hub |
+| Assignment/progress record in OSAC's configuration namespace | Hub; records the selected hosting target and native resource identities |
+| Admin-prepared provisioning Secret and native TBC | Hosting cluster, in the native Trident namespace |
+| Tenant StorageClasses and their readiness observation | Hosting cluster; StorageClasses are cluster-scoped |
+| VM, DataVolume, PVC and provisioned PV | Hosting cluster; VM/DataVolume/PVC use the tenant namespace, while PVs are cluster-scoped |
+| FC worker access and native disk I/O | Hosting cluster's eligible workers |
+
+The infrastructure admin configures the operator and AAP storage/compute jobs
+for the same hosting cluster using the existing remote kubeconfig mechanism.
+For remote mode, AAP storage jobs receive the mounted kubeconfig through
+`OSAC_REMOTE_CLUSTER_KUBECONFIG`; otherwise they use the hub context. The ONTAP
+role resolves this through `osac.service.common/get_remote_cluster_kubeconfig.yaml`
+in all four provider actions. Target Secret/TBC/class operations use that
+kubeconfig explicitly; progress-record operations explicitly use hub access.
+A configured but unusable remote connection fails; it never falls back to hub.
+
+Existing Stage 2 playbooks/dispatcher and the operator's StorageClass discovery
+already support a selected target. The ONTAP role still needs this routing in
+setup, class creation and both teardown actions, including hub-side state writes.
+The hub record includes `target_mode` (`hub` or `remote`), `target_cluster_uid`
+(the hosting cluster's `kube-system` Namespace UID) and the native namespace.
+AAP and the operator read that Namespace through their selected clients to
+check the same cluster identity before readiness. Different connection URLs
+for the same cluster do not change this identity.
+An active assignment cannot be retargeted by changing deployment credentials;
+guarded offboarding precedes a target change. This deployment contract adds no
+StorageBackend, StorageTier or Tenant request fields.
 
 ### 4.1.1 Before deployment: infrastructure preparation
 
@@ -72,12 +108,22 @@ storage starts OSAC; it cannot depend on tenant classes created afterward.
 Before claiming storage, the ONTAP role checks that the native driver and its
 required CRDs are available on the VM hosting cluster. Missing prerequisites
 fail onboarding with an actionable error; the role does not install the driver.
+In dedicated mode these prerequisites apply to the remote hosting cluster;
+management-cluster workers do not need HBAs merely to run OSAC services.
 
 The admin supplies cluster-management HTTPS reachability/trust and a discovery
 account allowed to read intended SVMs, management/FC interfaces, workload
 volumes/LUNs and QoS policies. SVM/LIF/account/policy creation or deletion
 privileges are unnecessary for that account. ONTAP management networking is
 provider infrastructure; it adds no OSAC Subnet/ExternalIP or VM attachment API.
+The [accepted VM networking contract](../OSAC-1435-vmaas-networking/design.md)
+continues to govern guest connectivity; storage targeting does not extend it.
+Management endpoints must be reachable from hub-side registration/AAP and from
+the hosting cluster's native Trident deployment. The admin grants AAP hub-state
+access and hosting-cluster Secret/TBC/StorageClass access; AAP and the operator
+can read the cluster-identity Namespace, and the operator can read hosting-cluster
+classes. Operator, storage jobs and compute jobs use the
+same selected hosting target.
 
 ### 4.1.2 Register backend and tiers
 
@@ -118,6 +164,8 @@ The infrastructure admin uses §4.2's convention to prepare:
 SVM accounts/native policies are administrator-prepared in this proposed
 baseline. OSAC does not choose an arbitrary free SVM. Another tenant needs its
 own preparation; missing prerequisites leave storage unavailable.
+The provisioning Secret is prepared in the selected hosting cluster, not copied
+to a tenant namespace or assumed to exist on the hub in dedicated mode.
 
 The management endpoint/account combination is an open preview decision (§9.5):
 
@@ -163,12 +211,14 @@ sequenceDiagram
     Operator->>Tenant: Publish name and tier bindings and set ClusterStorageReady
 ```
 
-Stage 1 resolves the exact SVM name, checks its UUID, management/FCP configuration,
+Stage 1 resolves the hosting target and exact SVM name, checks its UUID, management/FCP configuration,
 prepared policy values, credential authorization and absence of unclaimed workload
 data, then claims it for the current Tenant CR UID (§4.6). Stage 2 creates native
 backend/classes (§5). The operator polls jobs and observes configuration/classes;
 its existing reconciliation retries corrected preparation and completed stages.
-No ready binding is published before native backend/class success.
+The claim/source Secret is on the hosting cluster, the recovery record is on the
+hub, and TBC/class creation and observation use the hosting target. No ready
+binding is published before native backend/class success on that target.
 
 The resulting `{name, tier}` bindings feed the separate shared VM path. A Tenant
 User selects a tier through normal OSAC VM creation. That workstream creates a
@@ -245,7 +295,8 @@ a naming convention shared by the infrastructure admin and AAP:
 exists. `assignment_key` and `tier_key` are calculated name components, not new
 API fields. Calculating them creates no resources. This convention is an OSAC
 proposal, not an ONTAP requirement; an available-SVM pool or explicit mapping
-would change this lookup contract (§9.6).
+would change this lookup contract. Named preassignment is the selected MVP;
+pool allocation is outside its scope.
 
 ```text
 assignment_key = lowercase_hex(sha256(backend_id + "|" + tenant_name))[:16]
@@ -406,10 +457,14 @@ before claiming shared-worker tenant isolation (§9.3).
 
 Persist `ontap-tenant-<assignment_key>` in the Tenant CR's configuration namespace,
 with existing discovery labels, full Tenant CR UID/backend/SVM UUID, source Secret
-UID, endpoints/WWPNs, policy names, owned native resource IDs and phase. Do not
-store another copy of the SVM password. Record intended work before mutation,
+UID/namespace, `target_mode`/`target_cluster_uid`, native namespace,
+endpoints/WWPNs, policy names, owned native resource IDs and phase. Do not store
+another copy of the SVM password. Record intended work before mutation,
 then completed identities after readback. The operator checks phase/UID, not
 Secret presence, before setting storage readiness.
+It also checks the recorded hosting target against its configured target.
+Delete uses that recorded placement; a changed or unavailable target blocks
+cleanup rather than redirecting it to the hub or another cluster.
 
 Claim source metadata with Kubernetes resource-version checks; conflicts retry
 after reread. A retry with the same UID resumes completed work. A different UID,
@@ -458,8 +513,9 @@ tenant metadata but no garbage-collection relationship to the Tenant. AAP needs
 protected source-Secret access in the configured native-driver namespace.
 Selectors and shared-worker igroups do not enforce tenant authorization: verify
 API/admission prevents selection of another tenant's class, and the trusted
-worker exposes only the authorized disk to each guest (§9.3). The supported
-preview remains one shared cluster; cluster-per-tenant was not selected.
+worker exposes only the authorized disk to each guest (§9.3). The preview uses
+one shared VM hosting target per deployment, either the hub or a dedicated
+remote cluster; cluster-per-tenant was not selected.
 
 ## 4.8 Extensibility / Future-Proofing
 
@@ -550,7 +606,10 @@ on the cluster running native Trident. Discovery cannot retrieve an existing
 password, and registration credentials are never substituted for provisioning.
 The ONTAP role and these permission/preflight checks remain implementation work.
 Remote targeting and hub-side ownership records need the explicit routing in
-§9.7; a namespace name alone does not identify the correct cluster.
+§4.1; a namespace name alone does not identify the correct cluster. Storage
+and compute execution environments must mount the same configured remote
+connection, while retaining the hub connection for OSAC state. Missing remote
+credentials or a target mismatch leaves storage not ready.
 
 In this preview profile set `csi_driver_install_enabled=false` and
 `storage_provider_csi_backends_enabled=false`; check the full native deployment
@@ -559,8 +618,10 @@ All setup/delete jobs carry metadata.name/namespace/uid.
 
 ## IC-5: AAP state and consumption output
 
-**Requirements:** R3, R4, R5. Config/assignment Secret follows §4.6; safe AAP
+**Requirements:** R3, R4, R5. Hub config/assignment record follows §4.6; safe AAP
 results contain identities/endpoints/WWPNs and source Secret reference, not passwords.
+It includes the hosting target mode/cluster UID/native namespace. The source
+Secret and TBC belong to that target; the hub record contains references and progress only.
 
 TBC `ontap-<assignment_key>` in the configured native namespace references the
 prepared credential Secret: `storageDriverName=ontap-san`, `sanType=fcp`, discovered
@@ -597,8 +658,8 @@ credential/UID information blocks ONTAP teardown rather than a legacy skip.
 
 | Decision | Alternative / tradeoff |
 |---|---|
-| Dedicated prepared SVM | Automatic creation needs topology/addressing and privileged array mutations. A prepared-SVM pool keeps manual infrastructure setup but changes selection, credential lookup and claim/release coordination; selection remains open (§9.6). |
-| Deterministic resource names | An explicit admin-prepared tenant/backend-to-SVM/Secret mapping accommodates existing names but needs a defined protected record and lookup. The naming baseline avoids that additional mapping; it remains proposed (§9.6). |
+| Dedicated prepared SVM | Automatic creation needs topology/addressing and privileged array mutations. Pool selection adds availability, allocation and release coordination; the MVP uses named preassignment. |
+| Deterministic resource names | An explicit admin-prepared tenant/backend-to-SVM/Secret mapping accommodates existing names but needs a defined protected record and lookup. Named preassignment supplies the MVP lookup contract. |
 | Administrator-supplied credentials/policies | OSAC-generated accounts/policies reduce admin steps but need creation privileges and revocation ownership; not assumed by the prepared-SVM baseline (§9.4). |
 | Per-SVM management endpoint | A shared cluster endpoint with explicit SVM selection is a preview alternative; it requires cluster-scoped provisioning credentials and a qualified handoff. Retain the per-SVM baseline pending §9.5. |
 | Native Trident | OSAC CSI conflicts with the preview profile. Direct CSI allocation followed by DataVolume/PVC can provision twice; use native PVC provisioning and OSAC-6037 bookkeeping. |
@@ -678,39 +739,11 @@ and unverified lab permissions remain execution gaps.
   separate. Do not introduce a new backend field until the selected handoff
   demonstrates a need. PRD OQ-5.
 
-## 9.6 Is each SVM prepared for a named tenant, or selected from an available pool?
-
-- **Owner:** Storage Working Group / architects / configuration and onboarding owners.
-- **Impact:** The naming baseline preassigns resources before tenant creation.
-  Selecting any available prepared SVM instead requires a protected availability
-  marker, a defined selection/credential lookup, atomic claim under competing
-  onboardings, pool-exhaustion errors and guarded release. ONTAP operational state
-  alone does not establish availability for OSAC. An explicit preassignment
-  mapping is another option when existing resource names must be retained.
-  Pool allocation conflicts with the current PRD exclusion; resolve this before
-  implementing its selector. The October 8 technical discussion supports prepared
-  SVM adoption, but does not settle the concrete selection/credential contract.
-
-## 9.7 Must the preview support VM storage on the hub or a remote hosting cluster?
-
-- **Owner:** Architects / VMaaS and onboarding owners / QE.
-- **Impact:** Remote VM hosting changes where the source Secret, native TBC,
-  StorageClasses and driver checks run; Tenant/progress records remain on the
-  control cluster. Existing Stage 2 playbooks resolve
-  `OSAC_REMOTE_CLUSTER_KUBECONFIG` through the common role and pass the target
-  kubeconfig to provider dispatch. NetApp Stage 1 discovery/claim and Stage 2
-  creation/deletion must agree on that target, while explicitly retaining hub
-  access for ownership/status. Existing routing is not proof of this ONTAP flow.
-  The October 8 discussion expects either VM placement; the current PRD assumes
-  co-located OSAC/VMs. Confirm one hosting target per deployment versus concurrent
-  targets, then align scope and deployed verification. No new backend field is
-  justified solely by this expectation.
-
 ---
 
 ## Provenance
 
 Authored: revise @ design 0.11.3 - 2bd6607, workspace osac-5813-netapp-integration @ c8d0d8890
-Phases: draft, revise, revise, revise, revise, revise, revise, revise
+Phases: draft, revise, revise, revise, revise, revise, revise, revise, revise
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
