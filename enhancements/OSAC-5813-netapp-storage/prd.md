@@ -5,13 +5,14 @@
 | Author(s) | Zoltan Szabo |
 | Jira | [OSAC-5813](https://redhat.atlassian.net/browse/OSAC-5813) |
 | Date | 2026-10-05 |
-| Last updated | 2026-10-06 |
+| Last updated | 2026-10-08 |
 | Target milestone | OSAC 0.4 — Developer Preview (VMaaS integration) |
+| Status | Draft — prepared-SVM adoption; team agreement pending |
 
 ## Problem Statement
 
 Cloud Provider Admins already onboard tenants to VAST-backed storage through
-OSAC, but lack the same automated tenant onboarding/offboarding for NetApp ONTAP
+OSAC, but lack equivalent tenant onboarding/offboarding for NetApp ONTAP
 over Fibre Channel (FC). Providers need isolated tenant storage configuration
 and clear lifecycle status so that the shared VMaaS workflow can consume their
 NetApp tiers in the Developer Preview.
@@ -20,17 +21,20 @@ NetApp tiers in the Developer Preview.
 
 - Register one ONTAP backend and one or more FC block tiers through the existing
   UI, CLI, and API.
-- Automatically onboard tenants into separate storage virtual machines (SVMs),
-  each with its own management LIF (logical interface), centrally managed
-  credentials and usable storage configuration for its assigned tiers.
+- Bind each tenant to its dedicated, administrator-prepared storage virtual
+  machine (SVM), with a separate management LIF (logical interface), protected
+  credentials and usable configuration for its assigned tiers.
 - Offboard tenant storage using the established lifecycle safeguards.
 
-Installation and infrastructure preparation may use documented CLI steps.
+Administrators prepare dedicated SVMs, LIFs, credentials, native policies and
+the vendor driver using documented manual steps before OSAC adoption.
 Offboarding follows
 [OSAC-23](https://github.com/osac-project/enhancement-proposals/blob/main/enhancements/OSAC-23-tenant-storage-onboarding/prd.md),
 [OSAC-2117](https://github.com/osac-project/enhancement-proposals/blob/main/enhancements/OSAC-2117-pure-storage-flashblade/prd.md)
-and their data/dependency guards; completion confirms removal of owned tenant
-SVM/LIF configuration and credentials, with previous access invalidated.
+and their data/dependency guards; completion confirms removal of OSAC-owned
+configuration and the departing tenant's OSAC access. Administrator-prepared
+SVMs, LIFs, accounts and credential sources are retained; reuse requires verified
+data/access cleanup and explicit administrator authorization.
 Tenants receive no ONTAP management credentials.
 
 ### Required verification
@@ -39,8 +43,9 @@ Onboard two tenants and verify distinct SVMs and management LIFs, correct tier
 bindings, and FC access limited to authorized consumers. FC requires no separate
 tenant IP data LIF; its target LIFs and access configuration follow ONTAP's FC
 model. Failed onboarding remains not ready and retries avoid duplicate resources.
-Offboarding respects data/dependency guards, removes owned resources and access,
-and preserves the other tenant's storage. QE validates the resulting configuration
+Offboarding respects data/dependency guards, removes OSAC-owned resources/access,
+preserves prepared infrastructure and the other tenant's storage, and rejects
+unsafe reassignment. QE validates the resulting configuration
 through the shared VMaaS-over-FC flow; VM disk lifecycle implementation is a
 separate dependency below. Setup and acceptance may be performed manually.
 
@@ -55,7 +60,8 @@ separate dependency below. Setup and acceptance may be performed manually.
 - Migration between NetApp and other providers; supported in-place OSAC upgrades.
 - Performance benchmarking or custom QoS beyond native provider capabilities.
 - New NetApp-specific credential rotation or expiry-renewal automation.
-- Allocation from a pool of pre-created SVMs.
+- Automatic SVM/LIF creation/deletion, allocation from a free SVM pool, and
+  automatic sanitization or recycling.
 
 ## User Stories
 
@@ -67,12 +73,18 @@ separate dependency below. Setup and acceptance may be performed manually.
 - As a Cloud Provider Admin, I want multiple NetApp block tiers with native
   performance policies on the registered backend, so that tenants can select
   my storage offerings.
-- As a Cloud Provider Admin, I want automatic isolated SVM and management LIF
-  onboarding with safe, actionable privilege/resource-limit failures and retries, so that I can
-  enable tenant storage without duplicate allocations.
+- As a Cloud Provider Admin, I want OSAC to adopt each tenant's prepared SVM
+  and report missing preparation or onboarding failures, so that I can correct
+  the setup and retry safely.
 - As a Cloud Provider Admin, I want tenant offboarding to report completion or
   safe, actionable failures under existing dependency guards, so that I can
   recover cleanup and prevent tenant state leaking into subsequent assignments.
+
+### Cloud Infrastructure Admin
+
+- As a Cloud Infrastructure Admin, I want documented preparation and retention
+  requirements, so that I can supply dedicated tenant storage and manage its
+  safe reuse.
 
 ### Tenant Admin / Tenant User
 
@@ -88,10 +100,10 @@ separate dependency below. Setup and acceptance may be performed manually.
 - Infrastructure administrators supply workers with supported FC access, prepared
   zoning, management connectivity, and the required vendor storage deployment.
   These prerequisites use documented setup steps.
-- OSAC receives permission and credentials to create tenant SVMs and management
-  LIFs. Confirmation for target deployments is pending (OQ-4).
-- Management access or SVM creation does not prove FC connectivity; infrastructure
-  owners complete any zoning needed for newly created tenant targets.
+- Dedicated prepared-SVM adoption is the proposed preview model, pending team
+  agreement on administrator prerequisites (OQ-4).
+- Management access does not prove FC connectivity; infrastructure owners prepare
+  tenant targets and zoning before onboarding.
 - Existing central credential handling and lifecycle safeguards apply.
 
 ## Dependencies
@@ -112,8 +124,8 @@ separate dependency below. Setup and acceptance may be performed manually.
 
 - Management-only array access or workers without FC connectivity cannot establish
   VM consumption acceptance (OQ-2).
-- Missing SVM/LIF creation permissions prevent automatic onboarding; pre-created
-  SVM assignment requires a different agreed model (OQ-4).
+- Incomplete prepared storage or credentials block onboarding (OQ-4); retained
+  resources need verified data/access cleanup before reuse (OQ-3).
 - A mismatch with the shared consumption configuration can block VM acceptance
   despite successful tenant resource creation (OQ-1).
 
@@ -123,8 +135,8 @@ separate dependency below. Setup and acceptance may be performed manually.
 |---|---|---|---|
 | OQ-1 | Which tenant/tier configuration does the shared VM consumption path require, and who owns any NetApp-specific adaptation? | Open — Feature owner / OSAC-6037 workstream | Defines the onboarding output without duplicating shared VM lifecycle implementation. |
 | OQ-2 | Has the intended NetApp environment demonstrated working FC consumption from its OpenShift workers? | Access handed to E2E team; validation pending — QE / infrastructure owners | Establishes readiness for joint VM acceptance. |
-| OQ-3 | Which partial-onboarding and failed SVM/LIF/credential cleanup recovery steps satisfy existing safeguards? | Open — Storage Working Group / Core-secrets workstream | Defines safe recovery and offboarding completion without data loss or duplicate allocation. |
-| OQ-4 | Will target deployments provide privileges for OSAC to create tenant SVMs and management LIFs? | Open — Infrastructure/partner workstream / Feature owner | Required for create-on-onboard; pre-created SVM pooling is not an agreed fallback. |
+| OQ-3 | Do the recovery, offboarding and manual-reuse safeguards preserve tenant isolation? | Proposed — Storage Working Group / Core-secrets workstream | Prevents data loss and unsafe reuse of retained infrastructure. |
+| OQ-4 | Are dedicated administrator-prepared SVMs and their operational prerequisites accepted for the preview? | Proposed — Infrastructure/partner workstream / Feature owner | Confirms the preparation and ownership boundary. |
 
 ---
 
@@ -135,4 +147,4 @@ Final: revise @ prd 0.11.3 - 2bd6607, workspace osac-5813-netapp-integration @ c
 
 > Context changed between draft and revise.
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"prd","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","respond","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"prd","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","respond","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
