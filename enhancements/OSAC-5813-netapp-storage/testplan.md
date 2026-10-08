@@ -20,7 +20,7 @@ This matrix follows [Integration testing](https://github.com/osac-project/osac/b
 | Operator input and readiness, R2/R3, IC-4/5/6 | Unit + Envtest / owning DEV; TC-R2-02, TC-R3-01 | Extend `osac-operator/pkg/provisioning/aap_provider_test.go` and `internal/controller/storage_controller_test.go`; proposed `internal/controller/netapp_storage_envtest_test.go`; `make test` from osac-operator | Unit uses fake clients; Envtest uses real K8s/etcd, controlled jobs and API/provider doubles. No deployed AAP or Trident controller. |
 | AAP dispatch/state/resource routing, R3/R4, IC-4/5/6 | Component integration / onboarding DEV; TC-R3-02, TC-R4-01 | Extend storage-provider targets in `osac-aap/tests/integration/targets/`; proposed ONTAP fixture target registered in run_tests.sh; existing `STORAGE_TESTS_ENABLED=true make test` from osac-aap | Real Ansible and Kind APIs; proposed ONTAP HTTPS double and TBC status simulator. Existing VMS double does not provide ONTAP coverage. |
 | Operator → fulfillment feedback / deployed AAP → ONTAP, R3, IC-4/5/6 | Contract / onboarding DEV; TC-R3-03 | Proposed live contract harness, no committed runner/command yet | Must use real job launch/extra_vars and ONTAP readback; no fake provider. Execution gap belongs to [OSAC-4843](https://redhat.atlassian.net/browse/OSAC-4843) boundary work and this feature's DEV coverage; specific NetApp harness task not yet assigned. |
-| Native FC VM acceptance and isolation, R3/R5, IC-5/6 | E2E / QE with OSAC-6037 owner; TC-R5-01/02 | Manual acceptance in prepared lab; proposed automated extension of `tests/e2e/storage/test_tenant_storage_lifecycle.py` and VMaaS suite, runner not established | Real OSAC/AAP/ONTAP/Trident/CDI/KubeVirt/workers/fabric. Requires design §9.1/9.2; [OSAC-6037](https://redhat.atlassian.net/browse/OSAC-6037) shared VM path. No FC support claimed by existing storage-class-only tests. |
+| Native FC VM acceptance and isolation, R3/R5, IC-5/6 | E2E / QE with OSAC-6037 owner; TC-R5-01/02 | Manual acceptance in prepared lab; proposed automated extension of `tests/e2e/storage/test_tenant_storage_lifecycle.py` and VMaaS suite, runner not established | Real OSAC/AAP/ONTAP/Trident/CDI/KubeVirt/workers/fabric. Requires design §9.1/9.2/9.3/9.5; [OSAC-6037](https://redhat.atlassian.net/browse/OSAC-6037) shared VM path, agreed management/account model and two tenant VMs on the same worker/WWPNs. No FC support claimed by existing storage-class-only tests. |
 | Deployed guarded deletion, R4, IC-5/6 | E2E / QE; TC-R4-02 | Same manual lab acceptance; automate only after live path established | Real data/Trident dependencies and second-tenant preservation; prepared-resource retention and manual-release handoff required. |
 
 ## Test Cases
@@ -126,9 +126,9 @@ Progress/wrong-UID records never make StorageBackendReady true. Failed class bin
 Proposed ONTAP HTTPS double and TBC simulator in the existing Kind/Ansible harness; full IC-4 fixture; CSI-install flags disabled.
 ##### Steps
 1. Prepare matching SVM/source Secret/native policy fixtures. Dispatch setup, inject interruption after claim but before ready-state persistence, then retry. Try missing preparation, mismatched UUID and competing UID.
-2. Run class stage with TBC failure/timeout, then Bound/Success; inspect Secrets/classes and rerun.
+2. Run class stage with TBC failure/timeout, then Bound/Success; inspect Secrets/classes and rerun. Submit a credential/endpoint scope mismatch under the agreed management model.
 ##### Expected Results
-Role receives only referenced common connections and unchanged qos_limits.provider_config contents. Setup validates prepared resources, atomically claims full tenant UID/backend/SVM UUID/source UID and persists progress; retry resumes the same claim. Missing/mismatched preparation fails without creating SVMs/LIFs/accounts/policies. No driver-install task runs. No class is published before successful binding. Native configuration references the protected source Secret; no credential is copied to a tenant namespace. Replay preserves IDs and assignment_key.
+Role receives only referenced common connections and unchanged qos_limits.provider_config contents. Setup validates prepared resources, atomically claims full tenant UID/backend/SVM UUID/source UID and persists progress; retry resumes the same claim. Missing/mismatched preparation fails without creating SVMs/LIFs/accounts/policies. No driver-install task runs. No class is published before successful binding. Native configuration references the protected source Secret with explicit SVM selection and the approved endpoint/account scope; mismatch remains not ready without substituting discovery credentials. No credential is copied to a tenant namespace. Replay preserves IDs and assignment_key.
 
 #### TC-R3-03: Verify real AAP-to-ONTAP adoption and status feedback
 
@@ -137,12 +137,12 @@ Role receives only referenced common connections and unchanged qos_limits.provid
 | IC-4, IC-5, IC-6 | critical | manual | Contract | Onboarding DEV |
 
 ##### Preconditions
-Live operator/fulfillment/AAP/ONTAP runner agreed under the boundary work; two prepared SVMs, source credentials, matching native policies and native Trident. Read-only discovery permissions and SVM-account privileges are verified.
+Live operator/fulfillment/AAP/ONTAP runner agreed under the boundary work; two prepared SVMs, source credentials, matching native policies and native Trident. Read-only discovery permissions and the selected native endpoint/account privileges are verified. Per-SVM management is the proposed baseline; a shared endpoint is exercised only if design §9.5 selects and qualifies it.
 ##### Steps
 1. Launch normal Tenant storage jobs; compare prepared SVM/LIF/account/policy identities before/after and read storage conditions through the private API.
 2. Retry after interruption; attempt adoption with mismatched UUID/ownership, unclaimed workload data and missing source credentials/policy.
 ##### Expected Results
-Real launch reaches the role and its claim/native backend; existing SVM/LIF/account/policy UUIDs, addresses and WWPNs are unchanged. Native capped policy is SVM-scoped/non-shared with the requested cap and matching pool reference. Discovery/account failures remain not ready with sanitized reasons. Conflict/previous data rejects adoption before native configuration. Retry reuses the claim. Private API conditions reflect both storage stages and failures; SYNCED IDP state alone never establishes storage readiness.
+Real launch reaches the role and its claim/native backend; existing SVM/LIF/account/policy UUIDs, addresses and WWPNs are unchanged. Native TBC uses the approved endpoint/account scope and explicit SVM identity; provisioning never falls back to the read-only discovery identity. Native capped policy is SVM-scoped/non-shared with the requested cap and matching pool reference. Discovery/account failures remain not ready with sanitized reasons. Conflict/previous data rejects adoption before native configuration. Retry reuses the claim. Private API conditions reflect both storage stages and failures; SYNCED IDP state alone never establishes storage readiness.
 
 ### R4: Offboard under dependency guards and preserve other tenants
 
@@ -176,19 +176,20 @@ Active data blocks teardown with a visible dependency failure. After permitted c
 
 ### R5: Consume only the tenant's ready tiers through the shared VM path
 
-#### TC-R5-01: Two tenants use distinct SVMs and persist VM disk data over FC
+#### TC-R5-01: Two tenants share FC worker initiators and persist isolated VM disk data
 
 | Interface Change | Priority | Automation | Tier | Owner |
 |---|---|---|---|---|
 | IC-5, IC-6 | critical | manual | E2E | QE with OSAC-6037 owner |
 
 ##### Preconditions
-Prepared FC lab; no OSAC CSI deployment; agreed native Trident/shared VM route; eligible importer/VM workers have working HBA/fabric paths and prepared target zoning; two dedicated SVMs/accounts/policies/source Secrets are ready.
+Prepared FC lab; no OSAC CSI deployment; agreed native Trident/shared VM route and management/account model; eligible importer/VM workers have working HBA/fabric paths and prepared target zoning; two dedicated SVMs/accounts/policies/source Secrets are ready. Tenant A/B VMs can run on the same worker, whose HBA WWPNs are authorized for both SVMs under the supported igroup/LUN model.
 ##### Steps
 1. Register one backend/two tiers, prepare dedicated SVMs by convention and onboard tenants A/B normally; compare source/SVM/management IP/target ownership and bindings.
-2. Create a VM with a NetApp-backed DataVolume through the normal OSAC interface, write a known value to its disk, restart the VM and read it.
+2. Create A/B VMs with NetApp-backed DataVolumes through the normal OSAC interface, place them on the same FC-connected worker and inspect the shared host WWPN/igroup/LUN mappings and guest disk assignments.
+3. Correlate each private OSAC Volume record with its DataVolume/PVC and native allocation. Write distinct known values to A/B disks, restart both VMs and read them.
 ##### Expected Results
-Distinct prepared SVMs/management LIFs/IPs are adopted without infrastructure recreation; FC LIFs have SVM-scoped WWPNs, with no tenant IP data LIF. Each class selects only its tenant/backend/tier pool. DataVolume/PVC binds, the shared Volume identity is linked as defined by OSAC-6037, and the VM reads the same saved value after restart. Readiness alone is not accepted as FC I/O evidence; no manual per-VM disk bypass is used.
+Distinct prepared SVMs are adopted without infrastructure recreation. Management endpoints/accounts match the approved model; the proposed baseline has distinct management LIFs/IPs, while a qualified shared cluster endpoint retains explicit SVM selection. FC LIFs have SVM-scoped target WWPNs, with no tenant IP data LIF. Each class selects only its tenant/backend/tier pool. Both SVMs support the same trusted worker initiator WWPNs with correct native LUN mappings; A/B guests receive only their authorized disks. A private Volume record precedes each DataVolume; PVC/Trident performs physical provisioning without a second allocation triggered by OSAC bookkeeping. Shared Volume identity/status/cleanup follows OSAC-6037. Each VM reads its own saved value after restart. Readiness alone is not FC I/O evidence; no manual per-VM disk bypass is used.
 
 #### TC-R5-02: Cross-tenant class/access attempts are denied
 
@@ -197,20 +198,21 @@ Distinct prepared SVMs/management LIFs/IPs are adopted without infrastructure re
 | IC-5, IC-6 | critical | manual | E2E | QE |
 
 ##### Preconditions
-TC-R5-01 environment and tenant A identity; native Kubernetes permissions/admission boundary identified in design §9.3.
+TC-R5-01 shared-worker environment and tenant A identity; native Kubernetes permissions/admission and trusted-host guest-device boundary identified in design §9.3.
 ##### Steps
 1. Attempt A's VM/storage request selecting B's binding; if A can create native PVCs, attempt B's StorageClass directly.
 2. Attempt to read B's native/config credential Secrets; inspect igroup/LUN mappings for unauthorized initiator WWPNs.
+3. From A's guest, inspect accessible disks and attempt access to B's test disk/data; repeat from B toward A and compare with host-side device assignment.
 ##### Expected Results
-OSAC/admission denies cross-tenant selection before a B-backed claim is provisioned; any accepted request is an acceptance failure. A cannot read either credential Secret. LUN mappings include only authorized trusted worker initiators; an unauthorized initiator has no mapped LUN. Shared trusted workers are not claimed to be per-tenant physical initiators.
+OSAC/admission denies cross-tenant selection before a B-backed claim is provisioned; any accepted request is an acceptance failure. A cannot read either credential Secret. LUN mappings include only authorized trusted worker initiators; an unauthorized initiator has no mapped LUN. The shared trusted worker may access both tenants' mapped LUNs, but each guest can access only its authorized disk/data. Cross-guest access is an acceptance failure. Shared trusted workers are not claimed to be per-tenant physical initiators; separate SVMs/classes alone are not accepted as proof.
 
 ## Gaps
 
 ### Requirement Coverage Gaps
-All five PRD source anchors have planned cases. Executable live Contract and FC E2E coverage is unresolved: access has been handed off, but prepared resources/privileges, credential/release conventions and OSAC-6037 integration are not validated. No implementation tests ran during design drafting.
+All five PRD source anchors have planned cases. Executable live Contract and FC E2E coverage is unresolved: access has been handed off, but prepared resources/privileges, selected management/account scope, shared-WWPN/guest isolation, credential/release conventions and OSAC-6037 bookkeeping integration are not validated. No implementation tests ran during design drafting.
 
 ### Interface Change Coverage Gaps
-All six ICs have planned cases. Planning does not establish an execution path for TC-R3-03 or the deployed FC cases; the matrix records those gaps and responsible workstreams. Native cross-tenant PVC/class enforcement (§9.3) must be verified/assigned before TC-R5-02 can pass.
+All six ICs have planned cases. Planning does not establish an execution path for TC-R3-03 or the deployed FC cases; the matrix records those gaps and responsible workstreams. Native cross-tenant PVC/class enforcement, shared worker FC mappings and guest device isolation (§9.3) must be verified/assigned before TC-R5-01/02 can pass. Management/credential selection (§9.5) remains an execution prerequisite, not a requirement to implement both modes.
 
 ## Summary
 

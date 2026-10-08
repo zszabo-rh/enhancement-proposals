@@ -17,7 +17,9 @@ prepared storage and creates native Trident backend/tier bindings; it does not
 create or delete SVMs/LIFs. See [PRD](prd.md) for product requirements.
 
 This draft assumes acceptance of the prepared-SVM proposal. Credential and
-manual-release conventions below are concrete proposals for review (§9).
+manual-release conventions, names and schema changes below are concrete proposals
+for review (§9). The baseline uses separate SVM management endpoints/accounts;
+a shared cluster management endpoint remains an alternative requiring agreement.
 
 # 2. Goals and Non-Goals
 
@@ -112,6 +114,21 @@ SVM accounts/native policies are administrator-prepared in this proposed
 baseline. OSAC does not choose an arbitrary free SVM. Another tenant needs its
 own preparation; missing prerequisites leave storage unavailable.
 
+The management endpoint/account combination is an open preview decision (§9.5):
+
+| Model | Native Trident configuration | Preparation and privilege implications |
+|---|---|---|
+| Proposed baseline: per-SVM management | SVM management LIF, explicit `svm`, protected SVM-scoped account | Each SVM needs its own reachable HTTPS endpoint and account. |
+| Alternative: shared cluster management | Cluster management LIF, explicit `svm`, separately authorized cluster-scoped provisioning account | Endpoint is shared; credential permissions and protected source conventions need qualification. |
+
+Trident documents SVM management LIFs for SVM/`vsadmin` credentials and cluster
+management LIFs for cluster/`admin` credentials. Endpoint substitution alone is
+insufficient. The registration/discovery account stays read-only in either model;
+the role never falls back to it for provisioning. The shared model needs an
+agreed protected credential handoff, not a new tenant request header. Until
+confirmed, the preparation steps and example use the per-SVM baseline.
+[Native management/SVM settings](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-examples.html).
+
 ### 4.1.4 Create tenant and adopt storage
 
 Normal tenant creation produces a Tenant CR. Its core lifecycle reaching
@@ -148,9 +165,18 @@ backend/classes (§5). The operator polls jobs and observes configuration/classe
 its existing reconciliation retries corrected preparation and completed stages.
 No ready binding is published before native backend/class success.
 
-The resulting `{name, tier}` bindings feed the shared VM path. A Tenant User
-selects a tier through normal OSAC VM creation; OSAC-6037 owns Volume/PVC/DataVolume
-identity, provisioning and deletion. Joint acceptance verifies actual FC VM I/O.
+The resulting `{name, tier}` bindings feed the separate shared VM path. A Tenant
+User selects a tier through normal OSAC VM creation. That workstream creates a
+private OSAC Volume record for bookkeeping before creating the DataVolume;
+CDI creates its PVC, and Kubernetes invokes native Trident through the selected
+StorageClass to provision ONTAP storage. The OSAC record must not also trigger
+independent physical provisioning through the existing Volume reconciliation
+or direct CSI CreateVolume calls. That would allocate storage again when the
+PVC invokes Trident. No direct ONTAP Volume provisioner is required by this path.
+OSAC-6037 owns the bookkeeping-only reconciliation separation, Volume/DataVolume/
+PVC identity, status and cleanup. These shared changes are required work, not
+implementation already established by tenant onboarding. Joint acceptance
+verifies actual FC VM I/O and shared-worker isolation (§9.1/§9.3).
 
 ### 4.1.5 Delete tenant and retain prepared infrastructure
 
@@ -317,6 +343,12 @@ serves native volume operations; cluster credentials are never its fallback.
 Use verified trust, existing secret resolution, `no_log` and fact clearing.
 Do not return credentials in AAP results, API status or tenant namespaces.
 FC access uses authorized igroups/LUN mappings and zoning, not export policies.
+Worker HBA WWPNs identify trusted hosts, not tenant VMs. A shared worker may need
+authorized LUN access in several tenant SVMs; separate SVMs/classes do not give
+each guest a distinct physical initiator. Qualify shared-WWPN/igroup behavior
+and correct guest device assignment, alongside API/admission authorization,
+before claiming shared-worker tenant isolation (§9.3).
+[ONTAP FC host access](https://docs.netapp.com/us-en/ontap/san-admin/san-provisioning-fc-concept.html).
 
 ## 4.6 Failure Handling and Recovery
 
@@ -373,7 +405,9 @@ discovery labels and full UID ownership. Prepared sources/retained records carry
 tenant metadata but no garbage-collection relationship to the Tenant. AAP needs
 protected source-Secret access in the configured native-driver namespace.
 Selectors and shared-worker igroups do not enforce tenant authorization: verify
-API/admission prevents selection of another tenant's class (§9.3).
+API/admission prevents selection of another tenant's class, and the trusted
+worker exposes only the authorized disk to each guest (§9.3). The supported
+preview remains one shared cluster; cluster-per-tenant was not selected.
 
 ## 4.8 Extensibility / Future-Proofing
 
@@ -465,8 +499,12 @@ Delete/Immediate and the matching owner/backend/tier selector. Full tenant UID
 belongs in annotations/state; the selector naming key alone is not authorization.
 Existing labels/results populate `Tenant.status.storageClasses=[{name, tier}]`,
 `storage_provider_storage_class_names` and `tenant_storage_classes`. OSAC-6037 owns
-PVC/DataVolume modes and any Volume API adaptation; this output is not proof of
-completed consumption integration.
+PVC/DataVolume modes and Volume record correlation/status/cleanup; this output
+is not proof of completed consumption integration. The agreed native path uses private Volume
+bookkeeping followed by DataVolume/PVC-driven Trident provisioning (§4.1.4).
+OSAC-6037 must preserve disk identity/status/cleanup and bypass independent OSAC
+Volume allocation. This feature supplies the ready class binding; no direct
+ONTAP Volume provisioner or CSI allocation adapter is added.
 
 ## IC-6: Readiness, retries and teardown
 
@@ -486,7 +524,8 @@ credential/UID information blocks ONTAP teardown rather than a legacy skip.
 |---|---|
 | Dedicated prepared SVM | Automatic creation needs topology/addressing and privileged array mutations. An arbitrary free pool adds allocation/release coordination. Both exceed the proposed convention-based preview model. |
 | Administrator-supplied credentials/policies | OSAC-generated accounts/policies reduce admin steps but need creation privileges and revocation ownership; not assumed by the prepared-SVM baseline (§9.4). |
-| Native Trident | OSAC CSI conflicts with the preview profile. Direct allocation/custom PVC adoption adds a shared binding contract; agree adaptations with OSAC-6037. |
+| Per-SVM management endpoint | A shared cluster endpoint with explicit SVM selection is a preview alternative; it requires cluster-scoped provisioning credentials and a qualified handoff. Retain the per-SVM baseline pending §9.5. |
+| Native Trident | OSAC CSI conflicts with the preview profile. Direct CSI allocation followed by DataVolume/PVC can provision twice; use native PVC provisioning and OSAC-6037 bookkeeping. |
 | Typed tier oneof | Bare optional branches permit conflicts; Struct/Any weaken generated validation/forms or add unpacking. Typed branches with generic AAP pass-through preserve extensibility. |
 | Retained assignment record | Secret name/presence alone loses ownership on recreation. Durable full identity/source-generation checks add small state but allow safe retry and explicit manual release. |
 | Numeric IOPS ceiling | Translating read/write bandwidth changes semantics; referencing arbitrary policy names hides cap meaning. A typed cap plus prepared matching non-shared policy is explicit. |
@@ -515,11 +554,13 @@ and unverified lab permissions remain execution gaps.
 
 # 9. Open Questions
 
-## 9.1 Does the shared VM path accept these native bindings unchanged?
+## 9.1 What ready-class and Volume/DataVolume identity handoff does the shared VM path require?
 
 - **Owner:** Configuration/onboarding owners and OSAC-6037 workstream.
-- **Impact:** Confirm `{name, tier}` handoff and any provider-specific adaptation;
-  no generic VM lifecycle work is assigned to onboarding. PRD OQ-1.
+- **Impact:** Confirm authorized `{name, tier}` selection, private Volume-to-
+  DataVolume/PVC identity/status/cleanup and the bookkeeping-only reconciliation
+  bypass. Native PVC/Trident provisioning is the intended architecture; these
+  shared implementation details remain open, outside onboarding. PRD OQ-1.
 
 ## 9.2 Does the target lab meet the prepared-SVM/FC contract?
 
@@ -529,11 +570,16 @@ and unverified lab permissions remain execution gaps.
   zoning and tested native Trident version. Access handoff is not FC acceptance.
   `useREST=true` must be qualified on the target version. PRD OQ-2/OQ-4.
 
-## 9.3 Does shared-cluster authorization prevent cross-tenant class selection?
+## 9.3 Do shared FC workers and native API access preserve tenant disk isolation?
 
-- **Owner:** Storage Working Group / onboarding and shared-consumption owners.
-- **Impact:** Verify API/admission guards for native PVC access; selector/igroup
-  separation alone is insufficient. Missing enforcement needs an owner. PRD OQ-3.
+- **Owner:** Storage Working Group / architects / QE / shared-consumption owners.
+- **Impact:** Verify that two tenant SVMs/backends can use the same trusted
+  worker HBA WWPNs with supported igroup/LUN mappings, and each VM receives only
+  its authorized disk. Verify API/admission denies another tenant's class/PVC.
+  The VAST/NVMe NQN analogy does not establish ONTAP FC behavior. Missing
+  enforcement needs an owner; unsupported sharing blocks acceptance of the
+  current profile rather than silently changing it to cluster-per-tenant.
+  PRD OQ-3/OQ-6.
 
 ## 9.4 Are the credential and manual-release conventions accepted?
 
@@ -543,11 +589,21 @@ and unverified lab permissions remain execution gaps.
   draft baseline, not an answered credential decision. Changing to OSAC-created
   accounts/policies changes privileges and teardown ownership. PRD OQ-3/OQ-4.
 
+## 9.5 Which management endpoint and account scope are qualified for preview?
+
+- **Owner:** Storage Working Group / infrastructure owners / onboarding owner.
+- **Impact:** Confirm per-SVM endpoint/account or shared cluster endpoint with
+  explicit SVM selection and cluster-scoped provisioning permissions (§4.1.3).
+  Changing the baseline affects credential-source validation, native TBC settings
+  and preparation/acceptance; the common read-only discovery account stays
+  separate. Do not introduce a new backend field until the selected handoff
+  demonstrates a need. PRD OQ-5.
+
 ---
 
 ## Provenance
 
 Authored: revise @ design 0.11.3 - 2bd6607, workspace osac-5813-netapp-integration @ c8d0d8890
-Phases: draft, revise, revise, revise, revise, revise
+Phases: draft, revise, revise, revise, revise, revise, revise
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
