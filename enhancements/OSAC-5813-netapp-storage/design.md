@@ -286,8 +286,9 @@ message OntapAssociationConfig {
 }
 
 // Add to the existing private TenantConditionType enum.
-TENANT_CONDITION_TYPE_STORAGE_BACKEND_READY = 3;
-TENANT_CONDITION_TYPE_CLUSTER_STORAGE_READY = 4;
+// Preserve the existing COMPUTE_INFRASTRUCTURE_READY = 3.
+TENANT_CONDITION_TYPE_STORAGE_BACKEND_READY = 4;
+TENANT_CONDITION_TYPE_CLUSTER_STORAGE_READY = 5;
 ```
 
 The oneof is not a nested JSON object: input is `spec.backends[].ontap.maxIops`.
