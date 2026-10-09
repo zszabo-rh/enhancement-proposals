@@ -34,12 +34,12 @@ This matrix follows [Integration testing](https://github.com/osac-project/osac/b
 | IC-1 | critical | automated | Unit | Configuration DEV |
 
 ##### Preconditions
-Local verified-HTTPS probe double supports success, 401, 403, stalled response and untrusted certificate; a valid password_secret fixture exists.
+Local verified-HTTPS probe double supports success, 401, 403, stalled response, untrusted chain, expired certificate and hostname/IP mismatch; a valid password_secret fixture exists. Fulfillment's trust store contains the approved test CA.
 ##### Steps
 1. Create ONTAP backends using only common endpoint/credentials; submit malformed endpoint and password/password_secret conflicts. No physical configuration branch exists.
 2. Repeat valid Create against each probe outcome, including discovery-read denial; Update credentials with a partial mask; attempt immutable endpoint change.
 ##### Expected Results
-Valid Create completes bounded authenticated management/discovery reads against the cluster endpoint and persists READY, even before tenant SVMs exist. No array mutation occurs. Invalid endpoint/credential choice returns InvalidArgument before persistence. Probe 401 returns InvalidArgument; 403 FailedPrecondition; TLS/connect failure Unavailable; timeout DeadlineExceeded under the proposed 10-second total deadline. Credential Update validates merged state and repeats the probe; provider/ONTAP endpoint mutation is rejected. Responses/logs contain no password or raw auth response.
+Valid Create completes bounded authenticated management/discovery reads against the cluster endpoint and persists READY, even before tenant SVMs exist. No array mutation occurs. Invalid endpoint/credential choice returns InvalidArgument before persistence. Probe 401 returns InvalidArgument; 403 FailedPrecondition; untrusted, expired or mismatched certificates and connection failures return Unavailable without insecure retry; timeout returns DeadlineExceeded under the proposed 10-second total deadline. Credential Update validates merged state and repeats the probe; provider/ONTAP endpoint mutation is rejected. Responses/logs contain no password or raw auth response.
 
 #### TC-R1-02: CLI configuration survives API persistence
 
@@ -80,10 +80,10 @@ Backend payload contains provider=ontap and existing connection fields, with no 
 ##### Preconditions
 Stored ONTAP and VAST backends and existing private-tier handler test harness.
 ##### Steps
-1. Create ONTAP BLOCK tiers with an absent QoS branch, max_iops=0 and 5000.
-2. Submit NFS, multiple associations, nonexistent backend, ONTAP QoS on a VAST association, negative cap, nonzero generic bandwidth and immutable masked association/QoS/encryption updates.
+1. Create ONTAP BLOCK tiers with an absent QoS branch, max_iops=0, 5000 and the numeric REST-field maximum 2147483647.
+2. Submit NFS, multiple associations, nonexistent backend, ONTAP QoS on a VAST association, negative cap, cap=2147483648, nonzero generic bandwidth and immutable masked association/QoS/encryption updates.
 ##### Expected Results
-Valid tiers retain the native cap; absent/zero QoS is uncapped. API backend lookup rejects the provider/QoS mismatch with InvalidArgument, as well as malformed ONTAP associations; a nonexistent backend returns NotFound. No conversion to an FC enum or generic bandwidth cap occurs. Public tier output omits private provider settings. Existing providers retain their prior validation behavior.
+Valid tiers retain the native cap; absent/zero QoS adds no OSAC tier cap. Negative/above-range caps and provider/QoS mismatches return InvalidArgument, as do malformed ONTAP associations; a nonexistent backend returns NotFound. No conversion to an FC enum or generic bandwidth cap occurs. Public tier output omits private provider settings. Existing providers retain their prior validation behavior.
 
 #### TC-R2-02: Serialize one connection and provider-specific tier settings
 
@@ -125,14 +125,16 @@ Recorded target mode/cluster UID mismatches cannot establish StorageBackendReady
 | IC-4, IC-5, IC-6 | critical | automated | Component integration | Onboarding DEV |
 
 ##### Preconditions
-Proposed ONTAP HTTPS double and TBC simulator in the existing Kind/Ansible harness; full IC-4 fixture; CSI-install flags disabled. Exercise hub hosting and a second Kind cluster as the configured dedicated VM target; storage jobs retain hub access for recovery records.
+Proposed ONTAP HTTPS double and TBC simulator in the existing Kind/Ansible harness; full IC-4 fixture; source username/password/PEM CA fixtures; CSI-install flags disabled. AAP's discovery trust is configured separately. Exercise hub hosting and a second Kind cluster as the configured dedicated VM target; storage jobs retain hub access for recovery records.
 ##### Steps
 1. Prepare matching SVM/source Secret/native policy fixtures. Dispatch setup with native driver prerequisites missing, then present; inject interruption after claim but before ready-state persistence, then retry. Try missing preparation, mismatched UUID and competing UID.
 2. Run class stage with TBC failure/timeout, then Bound/Success; inspect Secrets/classes and rerun. Submit a credential/endpoint scope mismatch under the agreed management model, a missing source Secret and denied native-namespace access.
 3. Repeat setup/class actions with the remote target configured. Make its kubeconfig unreadable, then restore it; inspect source claims, hub-state placement and native resources.
+4. Remove or corrupt source ca.crt; present an untrusted, expired or hostname/IP-mismatched runtime certificate. Submit wrong-SVM/adaptive/shared/wrong-cap policy fixtures, missing capacity and incompatible encryption state.
 ##### Expected Results
 Role receives only referenced common connections and unchanged qos_limits.provider_config contents. Repeated backend/tenant inputs derive the same lookup names. Missing native driver prerequisites fail before claiming storage; no driver-install task runs. Setup validates prepared resources, atomically claims full tenant UID/backend/SVM UUID/source UID and persists progress; retry resumes the same claim. Missing/mismatched preparation fails without creating SVMs/LIFs/accounts/policies. No class is published before successful binding. Native configuration combines discovered SVM/endpoint, role driver/protocol/version defaults, resolved tier intent and the administrator-prepared Secret reference. Its credentials.name points to the source in the native namespace, with no embedded password or substitution of discovery credentials. Missing/denied Secret access and endpoint/account mismatches remain not ready with sanitized errors. No credential is copied to a tenant namespace. Replay preserves IDs and assignment_key.
 In dedicated mode source claim, TBC and StorageClass operations use the remote API; the progress record is written on the hub with the selected target mode/cluster UID. No native resources are created on the hub. Unreadable configured remote credentials fail rather than switching target. Operator readiness/target discovery is checked in TC-R3-01 and deployed acceptance.
+The TBC trustedCACertificate decodes once to the source PEM CA, separate from credentials.name; no password is embedded. Trust negatives fail before assignment claim without disabling verification. Capped policies match SVM UUID, fixed type, non-shared capacity and exact numeric ceiling; mismatches fail preparation. Pool encryption defaults are native strings derived from the generic boolean; necessarily encrypted capacity rejects a false tier. Missing assigned capacity or backend-bind permission failures block the stage. Later PVC allocation failures remain visible through native events; a ready binding alone does not establish successful consumption. No infrastructure is created to repair these failures.
 
 #### TC-R3-03: Verify real AAP-to-ONTAP adoption and status feedback
 
@@ -141,12 +143,12 @@ In dedicated mode source claim, TBC and StorageClass operations use the remote A
 | IC-4, IC-5, IC-6 | critical | manual | Contract | Onboarding DEV |
 
 ##### Preconditions
-Live operator/fulfillment/AAP/ONTAP runner agreed under the boundary work; two prepared SVMs, source credentials, matching native policies and native Trident. Read-only discovery permissions and the selected native endpoint/account privileges are verified. Per-SVM management is the proposed baseline; a shared endpoint is exercised only if design §9.5 selects and qualifies it.
+Live operator/fulfillment/AAP/ONTAP runner agreed under the boundary work; two prepared SVMs with assigned usable capacity, source credentials/CA chains, matching native policies and native Trident. Read-only discovery permissions and the selected native endpoint/account privileges are verified. The actual ONTAP family/version, Trident/OpenShift versions and worker profile are recorded. Per-SVM management is the proposed baseline; a shared endpoint is exercised only if design §9.5 selects and qualifies it.
 ##### Steps
 1. Launch normal Tenant storage jobs; compare prepared SVM/LIF/account/policy identities before/after and read storage conditions through the private API.
-2. Retry after interruption; attempt adoption with mismatched UUID/ownership, unclaimed workload data and missing source credentials/policy.
+2. Retry after interruption; attempt adoption with mismatched UUID/ownership, unclaimed workload data and missing source credentials/policy/CA. Inspect the generated native trust and policy settings.
 ##### Expected Results
-Real launch reaches the role and its claim/native backend; existing SVM/LIF/account/policy UUIDs, addresses and WWPNs are unchanged. Native TBC uses the approved endpoint/account scope and explicit SVM identity; provisioning never falls back to the read-only discovery identity. Native capped policy is SVM-scoped/non-shared with the requested cap and matching pool reference. Discovery/account failures remain not ready with sanitized reasons. Conflict/previous data rejects adoption before native configuration. Retry reuses the claim. Private API conditions reflect both storage stages and failures; SYNCED IDP state alone never establishes storage readiness.
+Real launch reaches the role and its claim/native backend; existing SVM/LIF/account/policy UUIDs, addresses and WWPNs are unchanged. Native TBC uses the approved endpoint/account scope, explicit SVM identity and trustedCACertificate encoding the source CA; the selected certificate passes chain/name/expiry validation. Provisioning never falls back to the read-only discovery identity. Native capped policy is SVM-scoped, fixed/non-shared, with the requested numeric cap and matching pool reference. Discovery/account/trust/preparation failures remain not ready with sanitized reasons. Conflict/previous data rejects adoption before native configuration. Retry reuses the claim. Private API conditions reflect both storage stages and failures; SYNCED IDP state alone never establishes storage readiness. Binding alone does not prove native write permissions or FC I/O; TC-R5-01 exercises those operations.
 
 ### R4: Offboard under dependency guards and preserve other tenants
 
@@ -190,14 +192,17 @@ Active data blocks teardown with a visible dependency failure. After permitted c
 
 ##### Preconditions
 Prepared FC lab; no OSAC CSI deployment; agreed native Trident/shared VM route and management/account model; eligible importer/VM workers have working HBA/fabric paths and prepared target zoning; two dedicated SVMs/accounts/policies/source Secrets are ready. Tenant A/B VMs can run on the same worker, whose HBA WWPNs are authorized for both SVMs under the supported igroup/LUN model. Run this case for hub hosting and dedicated remote hosting, each with one configured target; source Secrets/native Trident are installed on that target.
+Record the tested ONTAP family/version, Trident/OpenShift versions, native namespace, multipath settings and shared DataVolume/PVC volume/access modes. For the referenced native profile, find_multipaths is no. BLOCK catalog protocol does not establish raw PVC volumeMode. Qualify the selected modes without adding live migration to preview scope.
 ##### Steps
 1. Register one backend/two tiers, prepare dedicated SVMs by convention and onboard tenants A/B normally; compare source/SVM/management IP/target ownership and bindings.
 2. Create A/B VMs with NetApp-backed DataVolumes through the normal OSAC interface, place them on the same FC-connected worker and inspect the shared host WWPN/igroup/LUN mappings and guest disk assignments.
 3. Correlate each private OSAC Volume record with its DataVolume/PVC and native allocation. Write distinct known values to A/B disks, restart both VMs and read them.
 4. For dedicated hosting, inspect both clusters: Tenant/status/progress remain on the hub; native bindings and VM disk objects are on the configured remote cluster.
+5. Read back each provisioned volume's QoS association and encryption state; compare them with its requested tier. Confirm the runtime account performed the native allocation and SAN mapping operations.
 ##### Expected Results
 Distinct prepared SVMs are adopted without infrastructure recreation. Management endpoints/accounts match the approved model; the proposed baseline has distinct management LIFs/IPs, while a qualified shared cluster endpoint retains explicit SVM selection. FC LIFs have SVM-scoped target WWPNs, with no tenant IP data LIF. Each class selects only its tenant/backend/tier pool. Both SVMs support the same trusted worker initiator WWPNs with correct native LUN mappings; A/B guests receive only their authorized disks. A private Volume record precedes each DataVolume; PVC/Trident performs physical provisioning without a second allocation triggered by OSAC bookkeeping. Shared Volume identity/status/cleanup follows OSAC-6037. Each VM reads its own saved value after restart. Readiness alone is not FC I/O evidence; no manual per-VM disk bypass is used.
 In dedicated mode FC I/O comes from hosting-cluster workers; the hub needs management connectivity but no worker HBA merely to run OSAC. TBC, credential sources, StorageClasses, DataVolumes/PVCs/PVs and VMs are on the remote target. Ready bindings and guarded offboarding work through the hub API; no hub-local class substitutes for a missing remote class. Both deployment modes pass the disk persistence/isolation checks.
+Each volume matches the requested prepared fixed/non-shared QoS policy and encryption outcome. A positive IOPS setting is a ceiling, not reserved performance; zero/unset omits the OSAC tier policy and does not promise freedom from other array constraints. Native volume/LUN/igroup/mapping creation proves runtime permissions; TC-R4-02 verifies deletion. No accepted volume contradicts the advertised encryption flag.
 
 #### TC-R5-02: Cross-tenant class/access attempts are denied
 
@@ -217,7 +222,7 @@ OSAC/admission denies cross-tenant selection before a B-backed claim is provisio
 ## Gaps
 
 ### Requirement Coverage Gaps
-All five PRD source anchors have planned cases. Executable live Contract and FC E2E coverage is unresolved: access has been handed off, but prepared resources/privileges, selected management/account scope, shared-WWPN/guest isolation, credential/release conventions and OSAC-6037 bookkeeping integration are not validated. The MVP uses named preassignment; hub and dedicated remote hosting are required deployment modes. A dedicated FC target and cross-cluster credential/state/cleanup routing must be verified before acceptance. No implementation tests ran during design drafting.
+All five PRD source anchors have planned cases. Read-only management discovery has been exercised separately; it does not execute these planned tests. Live Contract and FC E2E coverage remains unresolved: the tested native profile, CA handoff, prepared capacity/runtime privileges, tier outcomes, selected management/account scope, Trident mappings/guest isolation, credential/release conventions and OSAC-6037 bookkeeping integration are not validated. ONTAP documents multi-SVM initiator reuse; deployed enforcement remains an acceptance check. The MVP uses named preassignment; hub and dedicated remote hosting are required deployment modes. A dedicated FC target and cross-cluster credential/state/cleanup routing must be verified before acceptance. No implementation tests ran during this documentation revision.
 
 ### Interface Change Coverage Gaps
 All six ICs have planned cases. Planning does not establish an execution path for TC-R3-03 or the deployed FC cases; the matrix records those gaps and responsible workstreams. Native cross-tenant PVC/class enforcement, shared worker FC mappings and guest device isolation (§9.3) must be verified/assigned before TC-R5-01/02 can pass. Management/credential selection (§9.5) remains an execution prerequisite, not a requirement to implement both modes.

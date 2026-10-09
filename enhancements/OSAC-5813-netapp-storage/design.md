@@ -6,7 +6,7 @@
 | Jira | [OSAC-5813](https://redhat.atlassian.net/browse/OSAC-5813) |
 | PRD | [prd.md](prd.md) |
 | Date | 2026-10-06 |
-| Last updated | 2026-10-08 |
+| Last updated | 2026-10-09 |
 | Status | Draft — named SVM preassignment; hub and dedicated VMaaS |
 
 # 1. Overview
@@ -103,17 +103,27 @@ The Cloud Infrastructure Admin prepares one connected OpenShift Virtualization
 cluster with supported FC access on every worker eligible for VMs or CDI imports:
 HBAs, fabric paths/zoning and multipath. Guests receive virtual disks. The admin
 installs a complete native Trident deployment, including CRDs and OpenShift
-permissions, and documents the tested version/namespace. Existing bootstrap
-storage starts OSAC; it cannot depend on tenant classes created afterward.
+permissions, and records the ONTAP family/version, Trident/OpenShift versions,
+native namespace and eligible worker configuration. For the referenced Trident
+25.10 profile, multipath uses `find_multipaths: no`. These are qualification
+inputs, not a claim that this version has been deployed or tested.
+[Native requirements](https://docs.netapp.com/us-en/trident-2510/trident-get-started/requirements.html).
+Existing bootstrap storage starts OSAC; it cannot depend on tenant classes
+created afterward.
 Before claiming storage, the ONTAP role checks that the native driver and its
 required CRDs are available on the VM hosting cluster. Missing prerequisites
 fail onboarding with an actionable error; the role does not install the driver.
 In dedicated mode these prerequisites apply to the remote hosting cluster;
 management-cluster workers do not need HBAs merely to run OSAC services.
 
-The admin supplies cluster-management HTTPS reachability/trust and a discovery
-account allowed to read intended SVMs, management/FC interfaces, workload
-volumes/LUNs and QoS policies. SVM/LIF/account/policy creation or deletion
+The admin supplies cluster-management HTTPS reachability and an approved CA
+chain, configured separately in Fulfillment's trust store and AAP's execution
+environment. Both clients verify the endpoint's certificate chain, hostname/IP
+and validity; neither disables verification. Native Trident receives its trust
+through the prepared source Secret described in §4.2. No new backend field or
+installer schema is introduced; manual trust setup must be documented.
+The discovery account is allowed to read intended SVMs, management/FC interfaces,
+workload volumes/LUNs and QoS policies. SVM/LIF/account/policy creation or deletion
 privileges are unnecessary for that account. ONTAP management networking is
 provider infrastructure; it adds no OSAC Subnet/ExternalIP or VM attachment API.
 The [accepted VM networking contract](../OSAC-1435-vmaas-networking/design.md)
@@ -145,19 +155,29 @@ The Cloud Provider Admin chooses the planned tenant metadata name and shares
 it, the returned backend ID and tier definitions with the infrastructure admin.
 The infrastructure admin uses §4.2's convention to prepare:
 
-1. One dedicated SVM, usable array capacity and no previous workload data or
-   conflicting assignment. Root/configuration volumes are distinguished from
-   tenant workload volumes during validation.
+1. One dedicated SVM with usable capacity and no previous workload data or
+   conflicting assignment. Conventional ONTAP requires assigned aggregates with
+   sufficient free space; qualify other array families' capacity model separately
+   (ASA r2 differs). Root/configuration volumes are distinguished from tenant
+   workload volumes during validation. The native `ontap-san` path creates a
+   FlexVol and LUN per PVC; one unused, pre-existing FlexVol is not its dynamic
+   capacity contract. [Backend preparation](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-prep.html),
+   [SAN allocation model](https://docs.netapp.com/us-en/trident-2510/trident-use/vol-import.html).
 2. A separate reachable management LIF allowing HTTPS; `default-management` is
    ONTAP's built-in service policy for management traffic, not an account role.
    An equivalent HTTPS-capable policy is acceptable. Enable FCP and prepare
    SVM-scoped FC target LIFs/WWPNs and zoning. Physical ports may be shared;
    logical FC LIFs belong to their SVM. No separate IP data LIF is needed for FC.
-3. An SVM-scoped account with native Trident's required permissions, plus the
-   protected credential Secret and full assignment metadata. Discovery cannot
-   recover an account password.
+3. An SVM-scoped account authorized for native Trident volume/LUN creation and
+   deletion, igroups and LUN mappings, plus the protected credential/CA Secret
+   and full assignment metadata. Use NetApp's supported `vsadmin`/equivalent
+   profile and verify runtime permissions; GET-only discovery does not prove
+   provisioning access. Trident owns these workload operations, while admins
+   retain SVM/LIF/account preparation. Discovery cannot recover an account
+   password. [Runtime account preparation](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-prep.html).
 4. For each capped tier, an SVM-owned, non-shared QoS policy matching its ceiling;
-   prepare the required volume-encryption capability for encrypted tiers.
+   prepare capacity, licensing/key management and encryption state compatible
+   with each tier (§4.2).
    QoS policy creation requires appropriate cluster-administrator privileges.
    [ONTAP QoS creation](https://docs.netapp.com/us-en/ontap-cli-9171/qos-policy-group-create.html).
 
@@ -262,7 +282,7 @@ oneof provider_qos {
 }
 message OntapAssociationConfig {
   option (cleanapi.message).private = true;
-  int64 max_iops = 1 [(buf.validate.field).int64.gte = 0];
+  int64 max_iops = 1 [(buf.validate.field).int64 = {gte: 0, lte: 2147483647}];
 }
 
 // Add to the existing private TenantConditionType enum.
@@ -271,11 +291,27 @@ TENANT_CONDITION_TYPE_CLUSTER_STORAGE_READY = 4;
 ```
 
 The oneof is not a nested JSON object: input is `spec.backends[].ontap.maxIops`.
-Positive values cap each volume; zero/unset adds no cap. Public tier shape stays
-unchanged. Existing read/write bandwidth fields must be zero for ONTAP; they are
-not equivalent to a combined IOPS ceiling. `encryption_enabled` remains generic.
-Native pools reference the matching pre-created policy and encryption defaults;
-unsupported/mismatched preparation fails. [Native pool settings](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-examples.html).
+Positive values set a per-volume ceiling; zero/unset adds no OSAC tier cap and
+does not remove other array constraints. It is not guaranteed/reserved IOPS.
+The proposed numeric range matches ONTAP's REST `fixed.max_throughput_iops`
+field, not every CLI/string limit. For a capped tier, the role verifies the
+prepared policy's SVM UUID, fixed rather than adaptive type,
+`fixed.capacity_shared=false` and exact numeric ceiling; unexpected additional
+limits fail preparation. Public tier shape stays unchanged. Existing read/write
+bandwidth fields must be zero for ONTAP; they are not equivalent to combined IOPS.
+[Policy schema](https://docs.netapp.com/us-en/ontap-restapi-9171/get-storage-qos-policies.html),
+[Ceiling semantics](https://docs.netapp.com/us-en/ontap/performance-admin/set-throughput-ceiling-qos-task.html).
+
+The proposed contract for generic `encryption_enabled` describes the requested
+data-at-rest outcome: true requires encrypted volumes; false requests unencrypted
+volumes. Prepared capacity must
+support that outcome. Trident's NVE setting does not disable inherited aggregate
+encryption (NAE), so a false tier on necessarily encrypted capacity is rejected,
+rather than advertised as unencrypted. The role maps the boolean to the native
+pool's string encryption default and verifies the resulting state during joint
+acceptance. Native pools reference the matching pre-created QoS policy; zero/unset
+omits the OSAC tier policy. [Native pool settings](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-examples.html),
+[Encryption behavior](https://docs.netapp.com/us-en/trident-2510/trident-reco/security-reco.html).
 
 ### Assignment and credential sources
 
@@ -308,7 +344,8 @@ capped-tier policy = osac-<assignment_key>-<tier_key>-qos
 
 Tenant name is the immutable metadata name, not its display name. The short key
 is a name component, not ownership proof. A protected Kubernetes Secret in the
-configured native Trident namespace holds `username`/`password` and annotations:
+configured native Trident namespace holds `username`, `password`, and `ca.crt`
+(the approved PEM CA chain, with no private key), plus annotations:
 
 | Annotation | Value |
 |---|---|
@@ -325,6 +362,19 @@ adoption; it is not a built-in ONTAP availability state or permission to select
 any unassigned SVM. AAP checks the Secret through its authorized Kubernetes
 connection; native Trident references it directly. Namespace/access configuration
 is part of the handoff (§5, IC-4). Tenants cannot read or change the handoff.
+
+AAP decodes Kubernetes `data["ca.crt"]` to PEM and uses it to verify the selected
+runtime management endpoint before claiming the assignment, including hostname/IP
+and expiry. It then base64-encodes the PEM once into TBC `spec.trustedCACertificate`;
+it must not base64-encode the already encoded Secret data again. The credential
+reference alone does not make Trident load `ca.crt`; this explicit projection is required.
+Missing/invalid trust fails preparation without an insecure fallback. Trident's
+versioned REST client enables certificate verification when this CA configuration
+is supplied. [Native CA setting](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-examples.html),
+[Trident v25.10.0 REST client](https://github.com/NetApp/trident/blob/v25.10.0/storage_drivers/ontap/api/ontap_rest.go).
+The versioned ONTAP credential parser reads username/password and leaves the
+extra CA key unused; the role owns the CA projection.
+[Credential parser](https://github.com/NetApp/trident/blob/v25.10.0/storage_drivers/types.go).
 
 ### 4.2.1 Worked example: one array, two tenants
 
@@ -372,7 +422,10 @@ Before normal tenant creation, infrastructure administrators prepare:
 | Credential Secret | `osac-79457936f209a67b-credentials` | `osac-1dfcf6434a6218ff-credentials` |
 | Non-shared 5,000 IOPS policy | `osac-79457936f209a67b-115dc3606fbf8691-qos` | `osac-1dfcf6434a6218ff-115dc3606fbf8691-qos` |
 
-Each Secret carries its full backend/name/SVM UUID and `available` state.
+Each Secret carries `username`, `password`, the approved CA chain in `ca.crt`,
+its full backend/name/SVM UUID and `available` state. For this false-encryption
+tier, the admin chooses capacity that can create unencrypted volumes; an
+NAE-encrypted aggregate would be incompatible.
 Onboarding A receives IC-4 input, discovers A's management endpoint, claims its
 Secret and configures native Trident using A's SVM account. B repeats this with
 its own prepared resources. The common backend endpoint/credential is used for
@@ -397,6 +450,7 @@ spec:
   useREST: true
   svm: osac-79457936f209a67b-svm
   managementLIF: 198.51.100.100
+  trustedCACertificate: "<base64-encoded PEM from source ca.crt>"
   credentials:
     name: osac-79457936f209a67b-credentials
   deletionPolicy: delete
@@ -407,6 +461,9 @@ Trident uses its Secret reference for subsequent volume provisioning. Neither
 the SVM password nor the read-only discovery login is embedded in the TBC.
 `version: 1` is the backend configuration format, not the installed Trident
 software version; the latter is recorded during infrastructure preparation.
+The illustrative management IP must appear in the server certificate's IP SAN;
+alternatively use a qualified hostname matching its DNS SAN. Fulfillment and AAP
+discovery trust their cluster endpoint separately from this native runtime CA.
 
 ## 4.3 API Changes
 
@@ -425,10 +482,10 @@ changes and tier backend/QoS/encryption mutations requiring rebinding; descripti
 and backend credentials remain updateable. Replacement follows existing
 resource dependency guards. Existing providers retain their behavior.
 
-Tier validation looks up its backend: one existing association, BLOCK, nonnegative
-native cap and zero generic bandwidth. An ONTAP QoS branch on another provider
-returns `InvalidArgument`; an absent backend returns `NotFound`. Unset native
-QoS is valid. Proto validation handles local constraints; provider agreement
+Tier validation looks up its backend: one existing association, BLOCK, a native
+cap in 0–2,147,483,647 and zero generic bandwidth. An ONTAP QoS branch on another
+provider returns `InvalidArgument`; an absent backend returns `NotFound`.
+Unset native QoS is valid. Proto validation handles local constraints; provider agreement
 needs the API lookup. No Tenant SVM/account parameters or new Secret API type.
 
 ## 4.4 Scalability and Performance
@@ -443,15 +500,18 @@ and cannot be discarded while their infrastructure can be reassigned.
 
 The discovery account remains read-only. The administrator-supplied SVM account
 serves native volume operations; cluster credentials are never its fallback.
-Use verified trust, existing secret resolution, `no_log` and fact clearing.
+Use the explicit CA handoff in §4.2, existing secret resolution, `no_log` and
+fact clearing.
 Do not return credentials in AAP results, API status or tenant namespaces.
 FC access uses authorized igroups/LUN mappings and zoning, not export policies.
 Worker HBA WWPNs identify trusted hosts, not tenant VMs. A shared worker may need
 authorized LUN access in several tenant SVMs; separate SVMs/classes do not give
-each guest a distinct physical initiator. Qualify shared-WWPN/igroup behavior
+each guest a distinct physical initiator. ONTAP documents that one initiator can
+interact with several SVMs. Qualify Trident's deployed igroup/LUN mappings
 and correct guest device assignment, alongside API/admission authorization,
 before claiming shared-worker tenant isolation (§9.3).
-[ONTAP FC host access](https://docs.netapp.com/us-en/ontap/san-admin/san-provisioning-fc-concept.html).
+[ONTAP FC host access](https://docs.netapp.com/us-en/ontap/san-admin/san-provisioning-fc-concept.html),
+[Multi-SVM initiators](https://docs.netapp.com/us-en/ontap-restapi-9171/get-protocols-san-initiators.html).
 
 ## 4.6 Failure Handling and Recovery
 
@@ -476,6 +536,7 @@ validated source claim. Prepared resources are not OSAC deletion targets.
 |---|---|
 | Backend/tier API or registration credential unavailable | Storage stays false; no default-class fallback; retry resolution |
 | Missing SVM, source Secret, management/FCP configuration or policy | `OntapPreparationMissing` / `OntapConfigurationInvalid`; no automatic infrastructure creation; admin corrects preparation |
+| Missing CA, invalid certificate or incompatible capacity/QoS/encryption | `OntapConfigurationInvalid`; no insecure fallback or ready binding; admin corrects the prepared source/endpoint/storage |
 | SVM account unusable or discovery permission missing | `OntapCredentialInvalid` / `OntapPermissionDenied`; no cluster-account substitution |
 | SVM UUID/assignment mismatch or unclaimed workload data | `OntapOwnershipConflict` / `OntapDependenciesRemain`; stop without mutation |
 | Native driver missing or bind deadline exceeded | `OntapDriverUnavailable` / `OntapBackendNotReady`; no ready class publication |
@@ -593,6 +654,7 @@ below to construct it.
 | SVM, credential Secret and policy names | Proposed assignment convention (§4.2); lookup only, not resource creation |
 | SVM UUID and eligible management/FC endpoints | ONTAP discovery; validate identity and use the agreed management-endpoint rule (§9.5) |
 | Runtime provisioning credentials | Admin-prepared Kubernetes Secret; TBC sets `credentials.name`, never the password |
+| Native management trust | The source Secret's PEM `ca.crt`; AAP verifies the endpoint, then base64-encodes it into `spec.trustedCACertificate` |
 | Native namespace and Kubernetes connection | Role/deployment configuration; locate the source Secret and create/observe the TBC |
 | Driver/protocol/version, lifecycle and tier pool settings | ONTAP role constants and resolved tier/native-policy configuration (IC-5) |
 
@@ -625,7 +687,8 @@ Secret and TBC belong to that target; the hub record contains references and pro
 
 TBC `ontap-<assignment_key>` in the configured native namespace references the
 prepared credential Secret: `storageDriverName=ontap-san`, `sanType=fcp`, discovered
-`svm`/SVM `managementLIF`, `useREST=true`, `deletionPolicy=delete`. Each tier virtual
+`svm`/SVM `managementLIF`, explicit `trustedCACertificate` from source `ca.crt`,
+`useREST=true`, `deletionPolicy=delete`. Each tier virtual
 pool has `osacOwner`, `osacBackend`, `osacTier` labels and matching QoS/encryption
 defaults. Omit IP `dataLIF`. [Native FC settings](https://docs.netapp.com/us-en/trident-2510/trident-use/ontap-san-examples.html),
 [credential references and backend lifecycle](https://docs.netapp.com/us-en/trident-2510/trident-use/backend-kubectl.html).
@@ -635,9 +698,14 @@ Delete/Immediate and the matching owner/backend/tier selector. Full tenant UID
 belongs in annotations/state; the selector naming key alone is not authorization.
 Existing labels/results populate `Tenant.status.storageClasses=[{name, tier}]`,
 `storage_provider_storage_class_names` and `tenant_storage_classes`. OSAC-6037 owns
-PVC/DataVolume modes and Volume record correlation/status/cleanup; this output
-is not proof of completed consumption integration. The agreed native path uses private Volume
-bookkeeping followed by DataVolume/PVC-driven Trident provisioning (§4.1.4).
+PVC/DataVolume modes and Volume record correlation/status/cleanup; the catalog's
+BLOCK protocol does not choose Kubernetes `volumeMode`. Qualify those modes with
+the native FC driver: filesystem/RWO supports a simple VM, while RWX requires
+raw Block. This does not add live migration to the MVP.
+[Native VM profile](https://docs.netapp.com/us-en/trident-2510/trident-get-started/requirements.html).
+This output is not proof of completed consumption integration. The agreed native
+path uses private Volume bookkeeping followed by DataVolume/PVC-driven Trident
+provisioning (§4.1.4).
 OSAC-6037 must preserve disk identity/status/cleanup and bypass independent OSAC
 Volume allocation. This feature supplies the ready class binding; no direct
 ONTAP Volume provisioner or CSI allocation adapter is added.
@@ -689,6 +757,14 @@ provisioning and cleanup. The [test plan](testplan.md) separates DEV boundary
 coverage from QE two-tenant FC VM/retention acceptance. Proposed live harnesses
 and unverified lab permissions remain execution gaps.
 
+Preview acceptance records the actual ONTAP/Trident/OpenShift versions and host
+profile; verifies discovery and native CA trust, usable capacity/runtime
+permissions, tier policies/encryption and source ownership; then executes the
+two-tenant VM persistence/isolation and guarded retention cases for both hosting
+modes. Documentation compatibility and successful management GETs do not satisfy
+those deployed checks. Trident 25.10 and ONTAP 9.17.1 are the reference evidence
+for this design; the installed profile still needs qualification.
+
 # 9. Open Questions
 
 ## 9.1 What ready-class and Volume/DataVolume identity handoff does the shared VM path require?
@@ -704,25 +780,27 @@ and unverified lab permissions remain execution gaps.
 - **Owner:** QE / infrastructure owners and infrastructure/partner workstream.
 - **Impact:** Verify ONTAP family/version, discovery/SVM account permissions,
   management trust, native QoS/encryption, two prepared SVMs, worker FC paths,
-  zoning and tested native Trident version. Access handoff is not FC acceptance.
-  `useREST=true` must be qualified on the target version. PRD OQ-2/OQ-4.
+  zoning, native Trident/OpenShift versions, multipath settings and agreed PVC
+  volume/access modes. Read-only management discovery has been exercised; native
+  provisioning and FC VM acceptance remain pending. `useREST=true` must be
+  qualified on the target version. PRD OQ-2/OQ-4.
 
 ## 9.3 Do shared FC workers and native API access preserve tenant disk isolation?
 
 - **Owner:** Storage Working Group / architects / QE / shared-consumption owners.
-- **Impact:** Verify that two tenant SVMs/backends can use the same trusted
-  worker HBA WWPNs with supported igroup/LUN mappings, and each VM receives only
-  its authorized disk. Verify API/admission denies another tenant's class/PVC.
-  The VAST/NVMe NQN analogy does not establish ONTAP FC behavior. Missing
-  enforcement needs an owner; unsupported sharing blocks acceptance of the
-  current profile rather than silently changing it to cluster-per-tenant.
+- **Impact:** ONTAP supports an initiator accessing several SVMs; the remaining
+  question is deployed enforcement. Verify Trident's mappings for the shared
+  worker WWPNs, each VM's authorized disk exposure and API/admission denial of
+  another tenant's class/PVC. Separate SVMs alone do not prove those boundaries.
+  Missing enforcement needs an owner and blocks acceptance of this profile.
+  [Vendor initiator contract](https://docs.netapp.com/us-en/ontap-restapi-9171/get-protocols-san-initiators.html).
   PRD OQ-3/OQ-6.
 
 ## 9.4 Are the credential and manual-release conventions accepted?
 
 - **Owner:** Storage Working Group / Core-secrets and infrastructure owners.
-- **Impact:** Agree the protected source Secret, retained record and new-generation
-  release checks. Administrator-supplied credentials/native policies are the stated
+- **Impact:** Agree the protected credential/CA source Secret, retained record and
+  new-generation release checks. Administrator-supplied credentials/native policies are the stated
   draft baseline, not an answered credential decision. Changing to OSAC-created
   accounts/policies changes privileges and teardown ownership. The baseline uses
   a prepared Kubernetes Secret; sourcing credentials from the Fulfillment secret
@@ -743,7 +821,9 @@ and unverified lab permissions remain execution gaps.
 
 ## Provenance
 
-Authored: revise @ design 0.11.3 - 2bd6607, workspace osac-5813-netapp-integration @ c8d0d8890
-Phases: draft, revise, revise, revise, revise, revise, revise, revise, revise
+Authored: draft @ design 0.11.3 - 2bd6607, workspace osac-5813-netapp-integration @ c8d0d8890
+Final: revise @ design 0.11.5 - 2c52e61, workspace osac-5813-netapp-integration @ c8d0d8890
 
-<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.3","ai_workflows":"2bd6607","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":false,"origin_untracked":false} -->
+> Context changed between draft and revise.
+
+<!-- ai-workflow-provenance:{"schema_version":1,"provenance_kind":"session","workflow":"design","workflow_version":"0.11.5","ai_workflows":"2c52e61","source_repo":"c8d0d8890","source_repo_branch":"osac-5813-netapp-integration","commits_behind_main":0,"commits_ahead_main":0,"main_ref":"main","phases":["draft","revise","revise","revise","revise","revise","revise","revise","revise","revise"],"authoring_modes":["skill"],"context_changed":true,"origin_untracked":false} -->
